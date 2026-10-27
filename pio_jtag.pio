@@ -1,0 +1,98 @@
+; SPDX-License-Identifier: GPL-2.0-only
+
+; JTAG host driven by commands in the TX FIFO
+; OUT      = TDI
+; SET      = TMS
+; IN       = TDO
+; side-set = TCK
+
+.program pio_jtag
+.side_set 1
+
+.define PUBLIC CYCLES_PER_TCK 5
+
+; cmd[4:0] = offset + handler (no autopull, it would prefetch the next cmd)
+.wrap_target
+dispatch:
+	pull block		side 0
+	out pc, 5		side 0
+
+; Shift-xR -> Exit1-xR: cmd[9:5] = pad, cmd[31:10] = nbits - 1, TDI words
+public shift:
+	out y, 5		side 0
+	out x, 22		side 0
+	jmp shift_test		side 0
+shift_loop:
+	pull ifempty block	side 0
+	out pins, 1		side 0
+	in pins, 1		side 1 [1]
+shift_test:
+	jmp x-- shift_loop	side 0
+
+	set pins, 1		side 0		; last bit, with TMS high
+	pull ifempty block	side 0
+	out pins, 1		side 0
+	in pins, 1		side 1 [1]
+
+	; pad = -nbits % 32 zeros push the last TDO word, LSB aligned
+	jmp pad_test		side 0
+pad_loop:
+	in null, 1		side 0
+pad_test:
+	jmp y-- pad_loop	side 0
+	jmp dispatch		side 0
+
+; cmd[31:5] = nbits - 1 (< 32), then a word of TMS bits
+public tms:
+	out x, 27		side 0
+	pull block		side 0
+tms_loop:
+	out y, 1		side 0
+	jmp !y tms_low		side 0
+	set pins, 1		side 0
+	jmp tms_clk		side 0
+tms_low:
+	set pins, 0		side 0 [1]	; matches the other branch
+tms_clk:
+	jmp x-- tms_loop	side 1 [1]
+.wrap
+
+% c-sdk {
+static inline uint32_t pio_jtag_tms_cmd(uint offset, unsigned nbits)
+{
+	return (offset + pio_jtag_offset_tms) | (nbits - 1) << 5;
+}
+
+static inline uint32_t pio_jtag_shift_cmd(uint offset, unsigned nbits)
+{
+	uint32_t pad = -nbits % 32;
+
+	return (offset + pio_jtag_offset_shift) | pad << 5 | (nbits - 1) << 10;
+}
+
+// Leaves the sm disabled, TCK low, TMS and TDI high
+static inline void pio_jtag_program_init(PIO pio, uint sm, uint offset,
+	uint tck, uint tms, uint tdi, uint tdo)
+{
+	const uint64_t out_mask = 1ull << tck | 1ull << tms | 1ull << tdi;
+
+	pio_sm_set_pins_with_mask64(pio, sm, 1ull << tms | 1ull << tdi, out_mask);
+	pio_sm_set_pindirs_with_mask64(pio, sm, out_mask, out_mask | 1ull << tdo);
+	pio_gpio_init(pio, tck);
+	pio_gpio_init(pio, tms);
+	pio_gpio_init(pio, tdi);
+	pio_gpio_init(pio, tdo);
+
+	// TDO is synchronous to our TCK, the synchronizer only adds delay
+	hw_set_bits(&pio->input_sync_bypass, 1u << (tdo - pio_get_gpio_base(pio)));
+
+	pio_sm_config c = pio_jtag_program_get_default_config(offset);
+	sm_config_set_out_pins(&c, tdi, 1);
+	sm_config_set_set_pins(&c, tms, 1);
+	sm_config_set_in_pins(&c, tdo);
+	sm_config_set_sideset_pins(&c, tck);
+	sm_config_set_out_shift(&c, true, false, 32);
+	sm_config_set_in_shift(&c, true, true, 32);
+	pio_sm_init(pio, sm, offset, &c);
+}
+%}
